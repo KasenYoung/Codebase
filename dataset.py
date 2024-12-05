@@ -168,4 +168,4 @@ class VideoDataset(Dataset):
         progress_dataset_bar.close()
         return videos
 
-dataset=VideoDataset()
+# dataset=VideoDataset()
