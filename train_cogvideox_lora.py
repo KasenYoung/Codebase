@@ -1,16 +1,4 @@
-# Copyright 2024 The CogView team, Tsinghua University & ZhipuAI and The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Modified by KasenYoung on Dec 6. Only focus on the training loop. Attempted to use Trigflow framework.
 
 import argparse
 import logging
@@ -20,39 +8,57 @@ import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
+
+import numpy as np
 import torch
+import torch.nn as nn
+import pdb
+import torchvision.transforms as TT
 import transformers
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import resize
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, T5EncoderModel, T5Tokenizer
 
 import diffusers
 from diffusers import AutoencoderKLCogVideoX, CogVideoXDPMScheduler, CogVideoXPipeline, CogVideoXTransformer3DModel
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.cogvideo.pipeline_cogvideox import get_resize_crop_region_for_grid
-from diffusers.training_utils import (
-    cast_training_params,
-    free_memory,
-)
+from diffusers.training_utils import cast_training_params, free_memory
 from diffusers.utils import check_min_version, convert_unet_state_dict_to_peft, export_to_video, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import is_compiled_module
+from dataset import VideoDataset
 
 
 if is_wandb_available():
     import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.31.0.dev0")
+#check_min_version("0.32.0.dev0")
 
 logger = get_logger(__name__)
+
+class AdaptiveWeighter(nn.Module):
+    def __init__(self,timeemb_dim=512):
+        super().__init__()
+        # timeemb_dim: 512, need to be consistent with transformer model.
+        self.timeemb_dim=timeemb_dim
+        self.mlp = nn.Linear(self.timeemb_dim,1)
+    
+    def forward(self,t):
+        return self.mlp(t)
+
+
+
 
 
 def get_args():
@@ -62,8 +68,7 @@ def get_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default="CogVideoX-2b",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -215,6 +220,54 @@ def get_args():
         type=int,
         default=720,
         help="All input videos are resized to this width.",
+    )
+
+    # TODO: add and check params in Trigflow.
+    parser.add_argument(
+        "--timeemb_dim",
+        type=int,
+        default=512,
+        help="Dimsension of time embedding.",
+    )
+
+    parser.add_argument(
+        "--sigma_data",
+        type=float,
+        default=0.5,
+        help="Variance of dataset.",
+    )
+
+    parser.add_argument(
+        "--P_mean",
+        type=float,
+        default= -0.4,
+        help="Used in sample timestep.",
+    )
+    parser.add_argument(
+        "--P_std",
+        type=float,
+        default= 1.4,
+        help="Used in sample timestep.",
+    )
+    parser.add_argument(
+        "--c",
+        type=float,
+        default=0.1,
+        help="Used in compute loss.",
+    )
+
+    parser.add_argument(
+        "--H",
+        type=int,
+        default=10000,
+        help="Used in warmup.",
+    )
+
+    parser.add_argument(
+        "--video_reshape_mode",
+        type=str,
+        default="center",
+        help="All input videos are reshaped to this mode. Choose between ['center', 'random', 'none']",
     )
     parser.add_argument("--fps", type=int, default=8, help="All input videos will be used at this FPS.")
     parser.add_argument(
@@ -405,185 +458,6 @@ def get_args():
     return parser.parse_args()
 
 
-class VideoDataset(Dataset):
-    def __init__(
-        self,
-        instance_data_root: Optional[str] = None,
-        dataset_name: Optional[str] = None,
-        dataset_config_name: Optional[str] = None,
-        caption_column: str = "text",
-        video_column: str = "video",
-        height: int = 480,
-        width: int = 720,
-        fps: int = 8,
-        max_num_frames: int = 49,
-        skip_frames_start: int = 0,
-        skip_frames_end: int = 0,
-        cache_dir: Optional[str] = None,
-        id_token: Optional[str] = None,
-    ) -> None:
-        super().__init__()
-
-        self.instance_data_root = Path(instance_data_root) if instance_data_root is not None else None
-        self.dataset_name = dataset_name
-        self.dataset_config_name = dataset_config_name
-        self.caption_column = caption_column
-        self.video_column = video_column
-        self.height = height
-        self.width = width
-        self.fps = fps
-        self.max_num_frames = max_num_frames
-        self.skip_frames_start = skip_frames_start
-        self.skip_frames_end = skip_frames_end
-        self.cache_dir = cache_dir
-        self.id_token = id_token or ""
-
-        if dataset_name is not None:
-            self.instance_prompts, self.instance_video_paths = self._load_dataset_from_hub()
-        else:
-            self.instance_prompts, self.instance_video_paths = self._load_dataset_from_local_path()
-
-        self.num_instance_videos = len(self.instance_video_paths)
-        if self.num_instance_videos != len(self.instance_prompts):
-            raise ValueError(
-                f"Expected length of instance prompts and videos to be the same but found {len(self.instance_prompts)=} and {len(self.instance_video_paths)=}. Please ensure that the number of caption prompts and videos match in your dataset."
-            )
-
-        self.instance_videos = self._preprocess_data()
-
-    def __len__(self):
-        return self.num_instance_videos
-
-    def __getitem__(self, index):
-        return {
-            "instance_prompt": self.id_token + self.instance_prompts[index],
-            "instance_video": self.instance_videos[index],
-        }
-
-    def _load_dataset_from_hub(self):
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError(
-                "You are trying to load your data using the datasets library. If you wish to train using custom "
-                "captions please install the datasets library: `pip install datasets`. If you wish to load a "
-                "local folder containing images only, specify --instance_data_root instead."
-            )
-
-        # Downloading and loading a dataset from the hub. See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-        dataset = load_dataset(
-            self.dataset_name,
-            self.dataset_config_name,
-            cache_dir=self.cache_dir,
-        )
-        column_names = dataset["train"].column_names
-
-        if self.video_column is None:
-            video_column = column_names[0]
-            logger.info(f"`video_column` defaulting to {video_column}")
-        else:
-            video_column = self.video_column
-            if video_column not in column_names:
-                raise ValueError(
-                    f"`--video_column` value '{video_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                )
-
-        if self.caption_column is None:
-            caption_column = column_names[1]
-            logger.info(f"`caption_column` defaulting to {caption_column}")
-        else:
-            caption_column = self.caption_column
-            if self.caption_column not in column_names:
-                raise ValueError(
-                    f"`--caption_column` value '{self.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                )
-
-        instance_prompts = dataset["train"][caption_column]
-        instance_videos = [Path(self.instance_data_root, filepath) for filepath in dataset["train"][video_column]]
-
-        return instance_prompts, instance_videos
-
-    def _load_dataset_from_local_path(self):
-        if not self.instance_data_root.exists():
-            raise ValueError("Instance videos root folder does not exist")
-
-        prompt_path = self.instance_data_root.joinpath(self.caption_column)
-        video_path = self.instance_data_root.joinpath(self.video_column)
-
-        if not prompt_path.exists() or not prompt_path.is_file():
-            raise ValueError(
-                "Expected `--caption_column` to be path to a file in `--instance_data_root` containing line-separated text prompts."
-            )
-        if not video_path.exists() or not video_path.is_file():
-            raise ValueError(
-                "Expected `--video_column` to be path to a file in `--instance_data_root` containing line-separated paths to video data in the same directory."
-            )
-
-        with open(prompt_path, "r", encoding="utf-8") as file:
-            instance_prompts = [line.strip() for line in file.readlines() if len(line.strip()) > 0]
-        with open(video_path, "r", encoding="utf-8") as file:
-            instance_videos = [
-                self.instance_data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0
-            ]
-
-        if any(not path.is_file() for path in instance_videos):
-            raise ValueError(
-                "Expected '--video_column' to be a path to a file in `--instance_data_root` containing line-separated paths to video data but found atleast one path that is not a valid file."
-            )
-
-        return instance_prompts, instance_videos
-
-    def _preprocess_data(self):
-        try:
-            import decord
-        except ImportError:
-            raise ImportError(
-                "The `decord` package is required for loading the video dataset. Install with `pip install decord`"
-            )
-
-        decord.bridge.set_bridge("torch")
-
-        videos = []
-        train_transforms = transforms.Compose(
-            [
-                transforms.Lambda(lambda x: x / 255.0 * 2.0 - 1.0),
-            ]
-        )
-
-        for filename in self.instance_video_paths:
-            video_reader = decord.VideoReader(uri=filename.as_posix(), width=self.width, height=self.height)
-            video_num_frames = len(video_reader)
-
-            start_frame = min(self.skip_frames_start, video_num_frames)
-            end_frame = max(0, video_num_frames - self.skip_frames_end)
-            if end_frame <= start_frame:
-                frames = video_reader.get_batch([start_frame])
-            elif end_frame - start_frame <= self.max_num_frames:
-                frames = video_reader.get_batch(list(range(start_frame, end_frame)))
-            else:
-                indices = list(range(start_frame, end_frame, (end_frame - start_frame) // self.max_num_frames))
-                frames = video_reader.get_batch(indices)
-
-            # Ensure that we don't go over the limit
-            frames = frames[: self.max_num_frames]
-            selected_num_frames = frames.shape[0]
-
-            # Choose first (4k + 1) frames as this is how many is required by the VAE
-            remainder = (3 + (selected_num_frames % 4)) % 4
-            if remainder != 0:
-                frames = frames[:-remainder]
-            selected_num_frames = frames.shape[0]
-
-            assert (selected_num_frames - 1) % 4 == 0
-
-            # Training transforms
-            frames = frames.float()
-            frames = torch.stack([train_transforms(frame) for frame in frames], dim=0)
-            videos.append(frames.permute(0, 3, 1, 2).contiguous())  # [F, C, H, W]
-
-        return videos
-
 
 def save_model_card(
     repo_id: str,
@@ -696,8 +570,13 @@ def log_validation(
 
     videos = []
     for _ in range(args.num_validation_videos):
-        video = pipe(**pipeline_args, generator=generator, output_type="np").frames[0]
-        videos.append(video)
+        pt_images = pipe(**pipeline_args, generator=generator, output_type="pt").frames[0]
+        pt_images = torch.stack([pt_images[i] for i in range(pt_images.shape[0])])
+
+        image_np = VaeImageProcessor.pt_to_numpy(pt_images)
+        image_pil = VaeImageProcessor.numpy_to_pil(image_np)
+
+        videos.append(image_pil)
 
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"
@@ -725,6 +604,7 @@ def log_validation(
                 }
             )
 
+    del pipe
     free_memory()
 
     return videos
@@ -825,7 +705,6 @@ def prepare_rotary_positional_embeddings(
     num_frames: int,
     vae_scale_factor_spatial: int = 8,
     patch_size: int = 2,
-    patch_size_t: int = 1,
     attention_head_dim: int = 64,
     device: Optional[torch.device] = None,
     base_height: int = 480,
@@ -836,15 +715,12 @@ def prepare_rotary_positional_embeddings(
     base_size_width = base_width // (vae_scale_factor_spatial * patch_size)
     base_size_height = base_height // (vae_scale_factor_spatial * patch_size)
 
-    p_t = patch_size_t
-    base_num_frames = (num_frames + p_t - 1) // p_t
-
     grid_crops_coords = get_resize_crop_region_for_grid((grid_height, grid_width), base_size_width, base_size_height)
     freqs_cos, freqs_sin = get_3d_rotary_pos_embed(
         embed_dim=attention_head_dim,
         crops_coords=grid_crops_coords,
         grid_size=(grid_height, grid_width),
-        temporal_size=base_num_frames,
+        temporal_size=num_frames,
     )
 
     freqs_cos = freqs_cos.to(device=device)
@@ -853,6 +729,7 @@ def prepare_rotary_positional_embeddings(
 
 
 def get_optimizer(args, params_to_optimize, use_deepspeed: bool = False):
+    #print(params_to_optimize)
     # Use DeepSpeed optimzer
     if use_deepspeed:
         from accelerate.utils import DummyOptim
@@ -873,7 +750,7 @@ def get_optimizer(args, params_to_optimize, use_deepspeed: bool = False):
         )
         args.optimizer = "adamw"
 
-    if args.use_8bit_adam and not (args.optimizer.lower() not in ["adam", "adamw"]):
+    if args.use_8bit_adam and args.optimizer.lower() not in ["adam", "adamw"]:
         logger.warning(
             f"use_8bit_adam is ignored when optimizer is not set to 'Adam' or 'AdamW'. Optimizer was "
             f"set to {args.optimizer.lower()}"
@@ -920,7 +797,6 @@ def get_optimizer(args, params_to_optimize, use_deepspeed: bool = False):
 
         optimizer = optimizer_class(
             params_to_optimize,
-            lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             beta3=args.prodigy_beta3,
             weight_decay=args.adam_weight_decay,
@@ -997,7 +873,7 @@ def main(args):
 
     # Prepare models and scheduler
     tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, use_fast=True
     )
 
     text_encoder = T5EncoderModel.from_pretrained(
@@ -1007,6 +883,16 @@ def main(args):
     # CogVideoX-2b weights are stored in float16
     # CogVideoX-5b and CogVideoX-5b-I2V weights are stored in bfloat16
     load_dtype = torch.bfloat16 if "5b" in args.pretrained_model_name_or_path.lower() else torch.float16
+
+    # we need a teacher transformer.
+    teacher_transformer = CogVideoXTransformer3DModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="transformer",
+        torch_dtype=load_dtype,
+        revision=args.revision,
+        variant=args.variant,
+    )
+
     transformer = CogVideoXTransformer3DModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="transformer",
@@ -1015,9 +901,13 @@ def main(args):
         variant=args.variant,
     )
 
+
     vae = AutoencoderKLCogVideoX.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
     )
+
+    # set the adaptive weighter. 
+    adaweighter=AdaptiveWeighter()
 
     scheduler = CogVideoXDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
@@ -1028,12 +918,15 @@ def main(args):
 
     # We only train the additional adapter LoRA layers
     text_encoder.requires_grad_(False)
+    teacher_transformer.requires_grad_(False)
     transformer.requires_grad_(False)
     vae.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weights (vae, text_encoder and transformer) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
+    #print(accelerator.state.deepspeed_plugin)
+    #pdb.set_trace()
     if accelerator.state.deepspeed_plugin:
         # DeepSpeed is handling precision, use what's in the DeepSpeed config
         if (
@@ -1045,7 +938,7 @@ def main(args):
             "bf16" in accelerator.state.deepspeed_plugin.deepspeed_config
             and accelerator.state.deepspeed_plugin.deepspeed_config["bf16"]["enabled"]
         ):
-            weight_dtype = torch.float16
+            weight_dtype = torch.bfloat16
     else:
         if accelerator.mixed_precision == "fp16":
             weight_dtype = torch.float16
@@ -1059,9 +952,10 @@ def main(args):
         )
 
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    teacher_transformer.to(accelerator.device,dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-
+    adaweighter.to(accelerator.device, dtype=weight_dtype)
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
@@ -1151,22 +1045,24 @@ def main(args):
         cast_training_params([transformer], dtype=torch.float32)
 
     transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-
+    adaweighter_parameters= list(filter(lambda p: p.requires_grad, adaweighter.parameters()))
     # Optimization parameters
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
-    params_to_optimize = [transformer_parameters_with_lr]
+    adaweighter_parameters_with_lr =   {"params": adaweighter_parameters, "lr": args.learning_rate}
+    params_to_optimize = [transformer_parameters_with_lr,adaweighter_parameters_with_lr]
+    #pdb.set_trace()
 
     use_deepspeed_optimizer = (
         accelerator.state.deepspeed_plugin is not None
-        and accelerator.state.deepspeed_plugin.deepspeed_config.get("optimizer", "none").lower() == "none"
+        and "optimizer" in accelerator.state.deepspeed_plugin.deepspeed_config
     )
     use_deepspeed_scheduler = (
         accelerator.state.deepspeed_plugin is not None
-        and accelerator.state.deepspeed_plugin.deepspeed_config.get("scheduler", "none").lower() == "none"
+        and "scheduler" in accelerator.state.deepspeed_plugin.deepspeed_config
     )
 
     optimizer = get_optimizer(args, params_to_optimize, use_deepspeed=use_deepspeed_optimizer)
-
+    #pdb.set_trace()
     # Dataset and DataLoader
     train_dataset = VideoDataset(
         instance_data_root=args.instance_data_root,
@@ -1176,6 +1072,7 @@ def main(args):
         video_column=args.video_column,
         height=args.height,
         width=args.width,
+        video_reshape_mode=args.video_reshape_mode,
         fps=args.fps,
         max_num_frames=args.max_num_frames,
         skip_frames_start=args.skip_frames_start,
@@ -1184,19 +1081,28 @@ def main(args):
         id_token=args.id_token,
     )
 
-    def encode_video(video):
+    def encode_video(video, bar):
+        bar.update(1)
         video = video.to(accelerator.device, dtype=vae.dtype).unsqueeze(0)
         video = video.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
         latent_dist = vae.encode(video).latent_dist
         return latent_dist
 
-    train_dataset.instance_videos = [encode_video(video) for video in train_dataset.instance_videos]
+    progress_encode_bar = tqdm(
+        range(0, len(train_dataset.instance_videos)),
+        desc="Loading Encode videos",
+    )
+    train_dataset.instance_videos = [
+        encode_video(video, progress_encode_bar) for video in train_dataset.instance_videos
+    ]
+    progress_encode_bar.close()
 
     def collate_fn(examples):
         videos = [example["instance_video"].sample() * vae.config.scaling_factor for example in examples]
         prompts = [example["instance_prompt"] for example in examples]
 
         videos = torch.cat(videos)
+        videos = videos.permute(0, 2, 1, 3, 4)
         videos = videos.to(memory_format=torch.contiguous_format).float()
 
         return {
@@ -1223,9 +1129,10 @@ def main(args):
         from accelerate.utils import DummyScheduler
 
         lr_scheduler = DummyScheduler(
+            name=args.lr_scheduler,
             optimizer=optimizer,
             total_num_steps=args.max_train_steps * accelerator.num_processes,
-            warmup_num_steps=args.lr_warmup_steps * accelerator.num_processes,
+            num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         )
     else:
         lr_scheduler = get_scheduler(
@@ -1238,10 +1145,10 @@ def main(args):
         )
 
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, train_dataloader, lr_scheduler
-    )
-
+    transformer, optimizer,train_dataloader, lr_scheduler = accelerator.prepare(
+        transformer,  optimizer,train_dataloader, lr_scheduler
+    )    
+    pdb.set_trace()
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -1313,11 +1220,14 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
 
+        # modify training loop here.
+        # TODO: check whehther it is correct.
+
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
 
             with accelerator.accumulate(models_to_accumulate):
-                model_input = batch["videos"].permute(0, 2, 1, 3, 4).to(dtype=weight_dtype)  # [B, F, C, H, W]
+                model_input = batch["videos"].to(dtype=weight_dtype)  # [B, F, C, H, W]
                 prompts = batch["prompts"]
 
                 # encode prompts
@@ -1330,7 +1240,8 @@ def main(args):
                     weight_dtype,
                     requires_grad=False,
                 )
-
+                
+                '''
                 # Sample noise that will be added to the latents
                 noise = torch.randn_like(model_input)
                 batch_size, num_frames, num_channels, height, width = model_input.shape
@@ -1349,7 +1260,6 @@ def main(args):
                         num_frames=num_frames,
                         vae_scale_factor_spatial=vae_scale_factor_spatial,
                         patch_size=model_config.patch_size,
-                        patch_size_t=model_config.patch_size_t,
                         attention_head_dim=model_config.attention_head_dim,
                         device=accelerator.device,
                     )
@@ -1381,6 +1291,86 @@ def main(args):
                 loss = torch.mean((weights * (model_pred - target) ** 2).reshape(batch_size, -1), dim=1)
                 loss = loss.mean()
                 accelerator.backward(loss)
+                '''
+
+                image_rotary_emb = (
+                    prepare_rotary_positional_embeddings(
+                        height=args.height,
+                        width=args.width,
+                        num_frames=num_frames,
+                        vae_scale_factor_spatial=vae_scale_factor_spatial,
+                        patch_size=model_config.patch_size,
+                        attention_head_dim=model_config.attention_head_dim,
+                        device=accelerator.device,
+                    )
+                    if model_config.use_rotary_positional_embeddings
+                    else None
+                )
+
+                def model_wrapper(x_t,t):
+                    x_pred = transformer(
+                    hidden_states=x_t,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep = t,
+                    image_rotary_emb=image_rotary_emb,
+                    return_dict=False,
+                    )[0]
+                    logvar = adaweighter(t)
+                    return x_t,t
+                
+                # sample z
+                import ipdb; ipdb.set_trace()
+                x_0 = batch['videos']
+                z = torch.randn_like(x_0)*args.sigma_data
+                tau = torch.randn(x_0.shape[0])*args.P_std + args.P_mean
+                tau = tau.reshape(-1,1,1,1,1)
+                tau.to(x_0.device)
+                tau= (tau*args.P_std+P.mean).exp()
+                t = torch.arctan(tau/sigma_data)
+
+                # compute x_t
+                x_t = torch.cos(t) * batch + torch.sin(t) * z
+                # compute dxt_dt
+                dxt_dt = teacher_transformer(
+                    hidden_states=x_t/args.sigma_data,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=t,
+                    image_rotary_emb=image_rotary_emb,
+                    return_dict=False,
+                )[0]
+
+                v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
+                v_t = torch.cos(t) * torch.sin(t)
+                F_theta, F_theta_grad, logvar = torch.func.jvp(
+                    model_wrapper, 
+                    (x_t / sigma_data, t),
+                    (v_x, v_t),
+                    has_aux=True
+                )
+                logvar = logvar.view(-1, 1, 1, 1)
+                F_theta_grad = F_theta_grad.detach()
+                F_theta_minus = F_theta.detach()
+
+                r = min(1.0, step / args.H)
+                # Calculate gradient g using JVP rearrangement
+                g = -torch.cos(t) * torch.cos(t) * (sigma_data * F_theta_minus - dxt_dt)
+                second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + sigma_data * F_theta_grad)
+                g = g + second_term
+                
+                # Tangent normalization
+                g_norm = torch.linalg.vector_norm(g, dim=(1, 2, 3, 4), keepdim=True)
+                g_norm = g_norm * np.sqrt(g_norm.numel() / g.numel())  
+                g = g / (g_norm + 0.1)  
+
+                weight = 1 / tau 
+                loss = (weight / torch.exp(logvar)) * torch.square(F_theta - F_theta_minus - g) + logvar
+                loss = loss.mean()
+                accelerator.backward(loss)
+                
+
+
+
+
 
                 if accelerator.sync_gradients:
                     params_to_clip = transformer.parameters()
@@ -1397,7 +1387,7 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                if accelerator.is_main_process:
+                if accelerator.is_main_process or accelerator.distributed_type == DistributedType.DEEPSPEED:
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
@@ -1437,7 +1427,6 @@ def main(args):
                     args.pretrained_model_name_or_path,
                     transformer=unwrap_model(transformer),
                     text_encoder=unwrap_model(text_encoder),
-                    vae=unwrap_model(vae),
                     scheduler=scheduler,
                     revision=args.revision,
                     variant=args.variant,
@@ -1480,6 +1469,10 @@ def main(args):
             save_directory=args.output_dir,
             transformer_lora_layers=transformer_lora_layers,
         )
+
+        # Cleanup trained models to save memory
+        del transformer
+        free_memory()
 
         # Final test inference
         pipe = CogVideoXPipeline.from_pretrained(
