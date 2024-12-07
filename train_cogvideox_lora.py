@@ -1,4 +1,4 @@
-# Modified by KasenYoung on Dec 6. Only focus on the training loop. Attempted to use Trigflow framework.
+# Modified by KasenYoung. Only focus on the training loop. Attempted to use Trigflow framework.
 
 import argparse
 import logging
@@ -1049,7 +1049,7 @@ def main(args):
     # Optimization parameters
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
     adaweighter_parameters_with_lr =   {"params": adaweighter_parameters, "lr": args.learning_rate}
-    params_to_optimize = [transformer_parameters_with_lr,adaweighter_parameters_with_lr]
+    params_to_optimize = [transformer_parameters_with_lr]
     #pdb.set_trace()
 
     use_deepspeed_optimizer = (
@@ -1064,6 +1064,7 @@ def main(args):
     optimizer = get_optimizer(args, params_to_optimize, use_deepspeed=use_deepspeed_optimizer)
     #pdb.set_trace()
     # Dataset and DataLoader
+    '''
     train_dataset = VideoDataset(
         instance_data_root=args.instance_data_root,
         dataset_name=args.dataset_name,
@@ -1080,6 +1081,8 @@ def main(args):
         cache_dir=args.cache_dir,
         id_token=args.id_token,
     )
+    '''
+    train_dataset = VideoDataset()
 
     def encode_video(video, bar):
         bar.update(1)
@@ -1148,7 +1151,7 @@ def main(args):
     transformer, optimizer,train_dataloader, lr_scheduler = accelerator.prepare(
         transformer,  optimizer,train_dataloader, lr_scheduler
     )    
-    pdb.set_trace()
+    #pdb.set_trace()
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -1315,21 +1318,26 @@ def main(args):
                     image_rotary_emb=image_rotary_emb,
                     return_dict=False,
                     )[0]
-                    logvar = adaweighter(t)
-                    return x_t,t
+                    #logvar = adaweighter(t)
+                    return x_pred #logvar
                 
                 # sample z
-                import ipdb; ipdb.set_trace()
+                import ipdb
+                
                 x_0 = batch['videos']
                 z = torch.randn_like(x_0)*args.sigma_data
+                z.to(x_0.device)
                 tau = torch.randn(x_0.shape[0])*args.P_std + args.P_mean
-                tau = tau.reshape(-1,1,1,1,1)
+                tau = tau.reshape(1,)
                 tau.to(x_0.device)
-                tau= (tau*args.P_std+P.mean).exp()
-                t = torch.arctan(tau/sigma_data)
-
+                tau= (tau*args.P_std+args.P_mean).exp()
+                t = torch.arctan(tau/args.sigma_data)
+                t = t.to(x_0.device)
+   
                 # compute x_t
-                x_t = torch.cos(t) * batch + torch.sin(t) * z
+                x_t = torch.cos(t) * x_0 + torch.sin(t) * z
+                x_t= x_t.to(prompt_embeds.dtype)
+                #ipdb.set_trace()
                 # compute dxt_dt
                 dxt_dt = teacher_transformer(
                     hidden_states=x_t/args.sigma_data,
@@ -1339,22 +1347,25 @@ def main(args):
                     return_dict=False,
                 )[0]
 
-                v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
+                v_x = torch.cos(t) * torch.sin(t) * dxt_dt / args.sigma_data
                 v_t = torch.cos(t) * torch.sin(t)
+                ipdb.set_trace()
+                
                 F_theta, F_theta_grad, logvar = torch.func.jvp(
                     model_wrapper, 
-                    (x_t / sigma_data, t),
+                    (x_t / args.sigma_data, t),
                     (v_x, v_t),
-                    has_aux=True
+                    
                 )
                 logvar = logvar.view(-1, 1, 1, 1)
+
                 F_theta_grad = F_theta_grad.detach()
                 F_theta_minus = F_theta.detach()
 
                 r = min(1.0, step / args.H)
                 # Calculate gradient g using JVP rearrangement
-                g = -torch.cos(t) * torch.cos(t) * (sigma_data * F_theta_minus - dxt_dt)
-                second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + sigma_data * F_theta_grad)
+                g = -torch.cos(t) * torch.cos(t) * (args.sigma_data * F_theta_minus - dxt_dt)
+                second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + args.sigma_data * F_theta_grad)
                 g = g + second_term
                 
                 # Tangent normalization
@@ -1367,7 +1378,7 @@ def main(args):
                 loss = loss.mean()
                 accelerator.backward(loss)
                 
-
+            
 
 
 
