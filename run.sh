@@ -8,7 +8,7 @@ export OUTPUT_PATH="cogvideox-lora-single-node"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 accelerate launch --config_file accelerate_config_machine_single.yaml \
-    training.py --instance_data_root subset-video/video --pretrained_model_name_or_path CogVideoX-2b \
+    train_cogvideox_lora.py --instance_data_root subset-video/video --pretrained_model_name_or_path CogVideoX-2b \
     --cache_dir $CACHE_PATH \
     --enable_tiling \
     --enable_slicing \

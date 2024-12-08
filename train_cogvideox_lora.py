@@ -47,15 +47,32 @@ if is_wandb_available():
 
 logger = get_logger(__name__)
 
-class AdaptiveWeighter(nn.Module):
-    def __init__(self,timeemb_dim=512):
+class CogVideoXWrapped(nn.Module):
+    def __init__(self, load_dtype, timeemb_dim=1):
         super().__init__()
+        
+        self.transformer = CogVideoXTransformer3DModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="transformer",
+            torch_dtype=load_dtype,
+            revision=args.revision,
+            variant=args.variant,
+        )
+        
         # timeemb_dim: 512, need to be consistent with transformer model.
         self.timeemb_dim=timeemb_dim
-        self.mlp = nn.Linear(self.timeemb_dim,1)
+        self.mlp = nn.Linear(self.timeemb_dim,1, dtype=load_dtype)
     
-    def forward(self,t):
-        return self.mlp(t)
+    def forward(self, hidden_states, encoder_hidden_states, timestep, image_rotary_emb, return_dict):
+        x_pred = self.transformer(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep = timestep,
+                image_rotary_emb=image_rotary_emb,
+                return_dict=return_dict,
+            )[0]
+        timestep = timestep.to(x_pred.dtype)
+        return x_pred, self.mlp(timestep)
 
 
 
@@ -893,13 +910,7 @@ def main(args):
         variant=args.variant,
     )
 
-    transformer = CogVideoXTransformer3DModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="transformer",
-        torch_dtype=load_dtype,
-        revision=args.revision,
-        variant=args.variant,
-    )
+    transformer = CogVideoXWrapped(load_dtype=load_dtype)
 
 
     vae = AutoencoderKLCogVideoX.from_pretrained(
@@ -907,7 +918,7 @@ def main(args):
     )
 
     # set the adaptive weighter. 
-    adaweighter=AdaptiveWeighter()
+    # adaweighter=AdaptiveWeighter()
 
     scheduler = CogVideoXDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
@@ -955,9 +966,9 @@ def main(args):
     teacher_transformer.to(accelerator.device,dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    adaweighter.to(accelerator.device, dtype=weight_dtype)
+    # adaweighter.to(accelerator.device, dtype=weight_dtype)
     if args.gradient_checkpointing:
-        transformer.enable_gradient_checkpointing()
+        transformer.transformer.enable_gradient_checkpointing()
 
     # now we will add new LoRA weights to the attention layers
     transformer_lora_config = LoraConfig(
@@ -966,7 +977,7 @@ def main(args):
         init_lora_weights=True,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-    transformer.add_adapter(transformer_lora_config)
+    transformer.transformer.add_adapter(transformer_lora_config)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1005,6 +1016,7 @@ def main(args):
 
         lora_state_dict = CogVideoXPipeline.lora_state_dict(input_dir)
 
+        import ipdb; ipdb.set_trace()
         transformer_state_dict = {
             f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
         }
@@ -1025,7 +1037,6 @@ def main(args):
         if args.mixed_precision == "fp16":
             # only upcast trainable parameters (LoRA) into fp32
             cast_training_params([transformer_])
-
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
 
@@ -1045,10 +1056,10 @@ def main(args):
         cast_training_params([transformer], dtype=torch.float32)
 
     transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    adaweighter_parameters= list(filter(lambda p: p.requires_grad, adaweighter.parameters()))
+    # adaweighter_parameters= list(filter(lambda p: p.requires_grad, adaweighter.parameters()))
     # Optimization parameters
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
-    adaweighter_parameters_with_lr =   {"params": adaweighter_parameters, "lr": args.learning_rate}
+    # adaweighter_parameters_with_lr =   {"params": adaweighter_parameters, "lr": args.learning_rate}
     params_to_optimize = [transformer_parameters_with_lr]
     #pdb.set_trace()
 
@@ -1063,8 +1074,6 @@ def main(args):
 
     optimizer = get_optimizer(args, params_to_optimize, use_deepspeed=use_deepspeed_optimizer)
     #pdb.set_trace()
-    # Dataset and DataLoader
-    '''
     train_dataset = VideoDataset(
         instance_data_root=args.instance_data_root,
         dataset_name=args.dataset_name,
@@ -1081,8 +1090,8 @@ def main(args):
         cache_dir=args.cache_dir,
         id_token=args.id_token,
     )
-    '''
-    train_dataset = VideoDataset()
+
+    # train_dataset = VideoDataset()
 
     def encode_video(video, bar):
         bar.update(1)
@@ -1218,7 +1227,7 @@ def main(args):
     vae_scale_factor_spatial = 2 ** (len(vae.config.block_out_channels) - 1)
 
     # For DeepSpeed training
-    model_config = transformer.module.config if hasattr(transformer, "module") else transformer.config
+    model_config = transformer.transformer.module.config if hasattr(transformer.transformer, "module") else transformer.transformer.config
 
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -1311,13 +1320,13 @@ def main(args):
                 )
 
                 def model_wrapper(x_t,t):
-                    x_pred = transformer(
-                    hidden_states=x_t,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep = t,
-                    image_rotary_emb=image_rotary_emb,
-                    return_dict=False,
-                    )[0]
+                    x_pred, logvar = transformer(
+                        hidden_states=x_t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep = t,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )
                     #logvar = adaweighter(t)
                     return x_pred #logvar
                 
@@ -1349,13 +1358,11 @@ def main(args):
 
                 v_x = torch.cos(t) * torch.sin(t) * dxt_dt / args.sigma_data
                 v_t = torch.cos(t) * torch.sin(t)
-                ipdb.set_trace()
                 
-                F_theta, F_theta_grad, logvar = torch.func.jvp(
+                F_theta, F_theta_grad, logvar = torch.autograd.functional.jvp(
                     model_wrapper, 
                     (x_t / args.sigma_data, t),
-                    (v_x, v_t),
-                    
+                    (v_x, v_t),   
                 )
                 logvar = logvar.view(-1, 1, 1, 1)
 
